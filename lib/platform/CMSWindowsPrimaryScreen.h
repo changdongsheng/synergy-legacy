@@ -87,11 +87,10 @@ private:
 
 	// key and button queries
 	KeyID				mapKey(WPARAM keycode, LPARAM info,
-							KeyModifierMask* maskOut, bool* altgr);
+							KeyModifierMask* maskOut);
 	ButtonID			mapButton(WPARAM msg, LPARAM button) const;
 	void				updateKey(UINT vkCode, bool press);
 	bool				isModifier(UINT vkCode) const;
-	KeyButton			mapKeyToScanCode(UINT vk1, UINT vk2) const;
 
 private:
 	IPrimaryScreenReceiver*	m_receiver;

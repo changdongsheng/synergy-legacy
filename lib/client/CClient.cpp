@@ -46,6 +46,7 @@ CClient::CClient(const CString& clientName) :
 	m_name(clientName),
 	m_screen(NULL),
 	m_server(NULL),
+	m_camp(false),
 	m_screenFactory(NULL),
 	m_socketFactory(NULL),
 	m_streamFilterFactory(NULL),
@@ -62,6 +63,13 @@ CClient::~CClient()
 	delete m_screenFactory;
 	delete m_socketFactory;
 	delete m_streamFilterFactory;
+}
+
+void
+CClient::camp(bool on)
+{
+	CLock lock(&m_mutex);
+	m_camp = on;
 }
 
 void
@@ -209,14 +217,14 @@ CClient::open()
 {
 	// open the screen
 	try {
-		LOG((CLOG_DEBUG "opening screen"));
+		LOG((CLOG_INFO "opening screen"));
 		openSecondaryScreen();
 		setStatus(kNotRunning);
 	}
 	catch (XScreenOpenFailure& e) {
 		// can't open screen
 		setStatus(kError, e.what());
-		LOG((CLOG_DEBUG "failed to open screen"));
+		LOG((CLOG_INFO "failed to open screen"));
 		throw;
 	}
 }
@@ -237,7 +245,7 @@ CClient::mainLoop()
 
 	try {
 		setStatus(kNotRunning);
-		LOG((CLOG_DEBUG "starting client \"%s\"", m_name.c_str()));
+		LOG((CLOG_NOTE "starting client \"%s\"", m_name.c_str()));
 
 		// start server interactions
 		{
@@ -251,7 +259,7 @@ CClient::mainLoop()
 
 		// clean up
 		deleteSession();
-		LOG((CLOG_DEBUG "stopping client \"%s\"", m_name.c_str()));
+		LOG((CLOG_NOTE "stopping client \"%s\"", m_name.c_str()));
 	}
 	catch (XMT& e) {
 		LOG((CLOG_ERR "client error: %s", e.what()));
@@ -259,7 +267,7 @@ CClient::mainLoop()
 
 		// clean up
 		deleteSession();
-		LOG((CLOG_DEBUG "stopping client \"%s\"", m_name.c_str()));
+		LOG((CLOG_NOTE "stopping client \"%s\"", m_name.c_str()));
 		throw;
 	}
 	catch (XBase& e) {
@@ -268,7 +276,7 @@ CClient::mainLoop()
 
 		// clean up
 		deleteSession();
-		LOG((CLOG_DEBUG "stopping client \"%s\"", m_name.c_str()));
+		LOG((CLOG_NOTE "stopping client \"%s\"", m_name.c_str()));
 		CLock lock(&m_mutex);
 		m_rejected = false;
 	}
@@ -277,16 +285,16 @@ CClient::mainLoop()
 
 		// clean up
 		deleteSession();
-		LOG((CLOG_DEBUG "stopping client \"%s\"", m_name.c_str()));
+		LOG((CLOG_NOTE "stopping client \"%s\"", m_name.c_str()));
 		throw;
 	}
 	catch (...) {
-		LOG((CLOG_ERR "client error: <unknown error>"));
+		LOG((CLOG_DEBUG "unknown client error"));
 		setStatus(kError);
 
 		// clean up
 		deleteSession();
-		LOG((CLOG_DEBUG "stopping client \"%s\"", m_name.c_str()));
+		LOG((CLOG_NOTE "stopping client \"%s\"", m_name.c_str()));
 		throw;
 	}
 }
@@ -295,7 +303,7 @@ void
 CClient::close()
 {
 	closeSecondaryScreen();
-	LOG((CLOG_DEBUG "closed screen"));
+	LOG((CLOG_INFO "closed screen"));
 }
 
 void
@@ -579,21 +587,40 @@ CClient::runServer()
 	CServerProxy* proxy = NULL;
 	bool timedOut;
 	try {
-		// allow connect and handshake this much time to succeed
-		CTimerThread timer(15.0, &timedOut);
+		for (;;) {
+			try {
+				// allow connect this much time to succeed
+				CTimerThread timer(15.0, &timedOut);
 
-		// create socket and attempt to connect to server
-		LOG((CLOG_DEBUG1 "connecting to server"));
-		if (m_socketFactory != NULL) {
-			socket = m_socketFactory->create();
+				// create socket and attempt to connect to server
+				LOG((CLOG_DEBUG1 "connecting to server"));
+				if (m_socketFactory != NULL) {
+					socket = m_socketFactory->create();
+				}
+				assert(socket != NULL);
+				socket->connect(m_serverAddress);
+				LOG((CLOG_INFO "connected to server"));
+				break;
+			}
+			catch (XSocketConnect& e) {
+				setStatus(kError, e.what());
+				LOG((CLOG_DEBUG "failed to connect to server: %s", e.what()));
+
+				// failed to connect.  if not camping then rethrow.
+				if (!m_camp) {
+					throw;
+				}
+
+				// we're camping.  wait a bit before retrying
+				ARCH->sleep(15.0);
+			}
 		}
-		assert(socket != NULL);
-		socket->connect(m_serverAddress);
 
 		// create proxy
-		LOG((CLOG_INFO "connected to server"));
 		LOG((CLOG_DEBUG1 "negotiating with server"));
 		proxy = handshakeServer(socket);
+		CLock lock(&m_mutex);
+		m_server = proxy;
 	}
 	catch (XThread&) {
 		if (timedOut) {
@@ -603,35 +630,22 @@ CClient::runServer()
 		else {
 			// cancelled by some thread other than the timer
 		}
-		delete proxy;
 		delete socket;
 		throw;
-	}
-	catch (XSocketConnect& e) {
-		LOG((CLOG_ERR "connection failed: %s", e.what()));
-		setStatus(kError, e.what());
-		delete socket;
-		return;
 	}
 	catch (XBase& e) {
 		LOG((CLOG_ERR "connection failed: %s", e.what()));
 		setStatus(kError, e.what());
-		LOG((CLOG_INFO "disconnecting from server"));
+		LOG((CLOG_DEBUG "disconnecting from server"));
 		delete socket;
 		return;
 	}
 	catch (...) {
 		LOG((CLOG_ERR "connection failed: <unknown error>"));
 		setStatus(kError);
-		LOG((CLOG_INFO "disconnecting from server"));
+		LOG((CLOG_DEBUG "disconnecting from server"));
 		delete socket;
 		return;
-	}
-
-	// saver server proxy object
-	{
-		CLock lock(&m_mutex);
-		m_server = proxy;
 	}
 
 	try {
@@ -695,6 +709,9 @@ CClient::handshakeServer(IDataSocket* socket)
 
 	CServerProxy* proxy = NULL;
 	try {
+		// give handshake some time
+		CTimerThread timer(30.0);
+
 		// wait for hello from server
 		LOG((CLOG_DEBUG1 "wait for hello"));
 		SInt16 major, minor;
